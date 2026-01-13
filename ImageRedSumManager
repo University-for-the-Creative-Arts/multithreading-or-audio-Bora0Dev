@@ -1,0 +1,141 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
+using UnityEngine;
+
+namespace ImageJobs
+{
+    /// <summary>
+    /// Drop this on an empty GameObject. Configure 'ImagePath' in the inspector.
+    /// On play, it loads the image, computes the red sum with single-thread + jobs, logs times, and writes telemetry to CSV.
+    /// </summary>
+    public class ImageRedSumManager : MonoBehaviour
+    {
+        [Header("Input")]
+        [Tooltip("Absolute path or path relative to project root. Example created by this repo: TestImages/test.png")]
+        public string ImagePath = "TestImages/test.png";
+
+        [Header("Jobs")]
+        [Range(64, 65536)]
+        public int BatchSize = 2048;
+
+        [Header("Options")]
+        public bool RunSingleThreadBaseline = true;
+        public bool ExportTelemetryCsv = true;
+        public string TelemetryCsvPath = "Telemetry/image_jobs_results.csv";
+
+        private Texture2D _tex;
+        private Color32[] _pixelsManaged;
+
+        void Start()
+        {
+            try
+            {
+                string resolved = ResolvePath(ImagePath);
+                LoadImage(resolved);
+                RunBenchmarks(resolved);
+            }
+            catch (Exception e)
+            {
+                UnityEngine.Debug.LogError($"[ImageRedSumManager] Error: {e}");
+            }
+        }
+
+        static string ResolvePath(string path)
+        {
+            if (Path.IsPathRooted(path)) return path;
+            // Assume path relative to project root (folder that contains Assets/). Application.dataPath points to <proj>/Assets
+            string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+            return Path.Combine(projectRoot, path);
+        }
+
+        void LoadImage(string absolutePath)
+        {
+            if (!File.Exists(absolutePath))
+                throw new FileNotFoundException($"Image not found: {absolutePath}");
+
+            byte[] bytes = File.ReadAllBytes(absolutePath);
+            _tex = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
+            if (!_tex.LoadImage(bytes, markNonReadable: false))
+                throw new Exception("Failed to load image data.");
+            _pixelsManaged = _tex.GetPixels32();
+            UnityEngine.Debug.Log($"Loaded image {_tex.width}x{_tex.height} from {absolutePath}");
+        }
+
+        void RunBenchmarks(string imgPath)
+        {
+            var telemetry = new TelemetryTable();
+            string imgName = Path.GetFileName(imgPath);
+
+            // Single-thread baseline
+            if (RunSingleThreadBaseline)
+            {
+                var sw = Stopwatch.StartNew();
+                long sum = SumRedSingleThread(_pixelsManaged);
+                sw.Stop();
+                UnityEngine.Debug.Log($"[SingleThread] Sum(R)={sum}, Time={sw.Elapsed.TotalMilliseconds:F3} ms");
+                telemetry.Add(new TelemetryRow
+                {
+                    Image = imgName,
+                    Mode = "SingleThread",
+                    BatchSize = 0,
+                    WorkerThreads = JobsUtility.JobWorkerCount,
+                    Milliseconds = sw.Elapsed.TotalMilliseconds,
+                    Result = sum
+                });
+            }
+
+            // Jobs + Burst
+            {
+                using var pixelsNative = new NativeArray<Color32>(_pixelsManaged, Allocator.TempJob);
+                int batches = Mathf.CeilToInt((float)pixelsNative.Length / BatchSize);
+                using var partials = new NativeArray<long>(batches, Allocator.TempJob);
+
+                var job = new SumRedJob
+                {
+                    Pixels = pixelsNative,
+                    PartialSums = partials,
+                    BatchSize = BatchSize
+                };
+
+                var sw = Stopwatch.StartNew();
+                JobHandle handle = job.Schedule(batches, 1);
+                handle.Complete();
+                long sum = 0;
+                for (int i = 0; i < partials.Length; i++) sum += partials[i];
+                sw.Stop();
+
+                UnityEngine.Debug.Log($"[Jobs+Burst] Sum(R)={sum}, Time={sw.Elapsed.TotalMilliseconds:F3} ms, Batches={batches}, BatchSize={BatchSize}, Workers={JobsUtility.JobWorkerCount}");
+                telemetry.Add(new TelemetryRow
+                {
+                    Image = imgName,
+                    Mode = "Jobs+Burst",
+                    BatchSize = BatchSize,
+                    WorkerThreads = JobsUtility.JobWorkerCount,
+                    Milliseconds = sw.Elapsed.TotalMilliseconds,
+                    Result = sum
+                });
+            }
+
+            if (ExportTelemetryCsv)
+            {
+                string resolved = ResolvePath(TelemetryCsvPath);
+                Directory.CreateDirectory(Path.GetDirectoryName(resolved));
+                File.WriteAllText(resolved, telemetry.ToCsv());
+                UnityEngine.Debug.Log($"Wrote telemetry CSV: {resolved}");
+            }
+        }
+
+        static long SumRedSingleThread(Color32[] pixels)
+        {
+            long sum = 0;
+            for (int i = 0; i < pixels.Length; i++)
+                sum += pixels[i].r;
+            return sum;
+        }
+    }
+}
